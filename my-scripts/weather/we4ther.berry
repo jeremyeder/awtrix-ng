@@ -1,0 +1,172 @@
+# @name we4ther
+# @desc Shows current/low/high temperature in one turn, with the Dim transition between them
+# @author github: jeremyeder
+# @version 1.0
+# @config lat number "Latitude" default=52.52 min=-90 max=90 step=0.0001
+# @config lon number "Longitude" default=13.40 min=-180 max=180 step=0.0001
+# @config unit select "Temperature unit" default=F options=C,F
+# @config every number "Refresh" default=15 min=15 max=60 unit=min
+
+class We4ther
+  var stops, ticks, period, busy, raw, low, high, t0
+
+  def init()
+    # Colour stops: lower bound, colour - interpolated in between
+    self.stops = [-12, 0xD977DF, -6, 0x9545BC, -1, 0x4B379C, 0, 0xFEC4FF,
+                  4, 0x31B8DB, 10, 0x31DB8B, 15, 0x6ED228, 21, 0xFFFF28,
+                  27, 0xF87E27, 32, 0xCF3927, 38, 0xA12527]
+    self.period = store.get("every") * 60
+    self.raw = store.get("temp")
+    self.low = store.get("low")
+    self.high = store.get("high")
+    self.ticks = 0
+    self.busy = false
+    self.t0 = 0
+  end
+
+  def value_for(t)
+    # Converts a raw Celsius temperature to the configured unit,
+    # so a C/F switch takes effect right after saving the settings
+    var u = store.get("unit")
+    var v = u == "F" ? t * 1.8 + 32 : t
+    return str(int(v + (v >= 0 ? 0.5 : -0.5))) + (u == "F" ? "F" : "°")
+  end
+
+  def screen(name, t)
+    # A 3-digit value ("100F") needs the space after the colon dropped,
+    # or the line runs a couple of pixels past the edge of the panel
+    var value = self.value_for(t)
+    var sep = size(value) >= 4 ? "" : " "
+    return [[name + ":" + sep, 0x888888], [value, self.color_for(t)]]
+  end
+
+  def current_screen() return self.screen("Temp", self.raw) end
+  def low_screen() return self.screen("Low", self.low) end
+  def high_screen() return self.screen("High", self.high) end
+
+  def screen_at(i)
+    if i == 1 return self.low_screen() end
+    if i == 2 return self.high_screen() end
+    return self.current_screen()
+  end
+
+  def scale_color(c, f)
+    # Same math as the firmware's own Dim transition (TransitionComposer.cpp):
+    # scales a color's brightness toward black
+    if f < 0 f = 0 elif f > 1 f = 1 end
+    var r = int(c / 65536 % 256 * f)
+    var g = int(c / 256 % 256 * f)
+    var b = int(c % 256 * f)
+    return rgb(r, g, b)
+  end
+
+  def scale_parts(parts, f)
+    var out = []
+    for p : parts
+      out.push([p[0], self.scale_color(p[1], f)])
+    end
+    return out
+  end
+
+  def color_for(v)
+    var s = self.stops
+    if v <= s[0] return s[1] end
+    var j = 0
+    while j < 20 && v >= s[j + 2]
+      j += 2
+    end
+    if j >= 20 return s[21] end
+    var a = s[j + 1]
+    var b = s[j + 3]
+    var f = (v - s[j]) * 1.0 / (s[j + 2] - s[j])
+    return rgb(int(a / 65536 % 256 + (b / 65536 % 256 - a / 65536 % 256) * f),
+               int(a / 256 % 256 + (b / 256 % 256 - a / 256 % 256) * f),
+               int(a % 256 + (b % 256 - a % 256) * f))
+  end
+
+  def on_body(w, status)
+    self.busy = false
+    if w == nil return end
+    var m = re.search("_2m\":([-0-9.]+)", w)
+    var lo = re.search("temperature_2m_min\":\\[([-0-9.]+)", w)
+    var hi = re.search("temperature_2m_max\":\\[([-0-9.]+)", w)
+    if m == nil return end
+    var t = num(m[1])
+    if t == nil return end
+
+    self.raw = t
+    self.low = lo == nil ? nil : num(lo[1])
+    self.high = hi == nil ? nil : num(hi[1])
+
+    store.set("temp", self.raw)
+    store.set("low", self.low)
+    store.set("high", self.high)
+  end
+
+  def loop()
+    if self.ticks <= 0 && !self.busy
+      self.ticks = self.period
+      self.busy = true
+      http.get("http://api.open-meteo.com/v1/forecast" +
+               "?latitude=" + str(store.get("lat")) +
+               "&longitude=" + str(store.get("lon")) +
+               "&current=temperature_2m" +
+               "&daily=temperature_2m_max,temperature_2m_min" +
+               "&forecast_days=1&timeformat=unixtime&timezone=auto",
+               / b, st -> self.on_body(b, st),
+               {'find': "\"current\":", 'keep': 512})
+    end
+    self.ticks -= 1
+  end
+
+  def on_show()
+    self.t0 = now_ms()
+  end
+
+  def duration()
+    # Holds the app for all 3 screens, each shown for the device's
+    # own "Time per app" setting, instead of spreading them across
+    # separate rotation turns
+    var slot = settings.get("appDurationMs")
+    return self.low != nil && self.high != nil ? slot * 3 : slot
+  end
+
+  def draw()
+    clear()
+    if self.raw == nil
+      text(6, 6, "...", 0x666666)
+      return
+    end
+
+    var parts = self.current_screen()
+    if self.low != nil && self.high != nil
+      var slot = settings.get("appDurationMs")
+      var elapsed = now_ms() - self.t0
+      # Clamp, don't wrap: the device's real dwell time runs longer than the
+      # 3-slot duration() estimate by an amount that isn't predictable from
+      # the script, so this holds on High rather than risk a sub-second
+      # flash of the wrong screen right as the app is cut off
+      var i = min(int(elapsed / slot), 2)
+      parts = self.screen_at(i)
+
+      # Replays the "Dim" transition (TransitionComposer.cpp) during the last
+      # transitionDurationMs of each screen, fading to black then into the next
+      var trans = settings.get("transitionDurationMs")
+      if i < 2 && trans > 0
+        trans = min(trans, int(slot / 2))
+        var pos = elapsed - i * slot
+        var remain = slot - pos
+        if remain <= trans
+          var p = 1.0 - remain * 1.0 / trans
+          parts = p < 0.5 ? self.scale_parts(self.screen_at(i), 1.0 - 2 * p)
+                           : self.scale_parts(self.screen_at(i + 1), 2 * p - 1.0)
+        end
+      end
+    end
+
+    var w = text_ink_width(parts)
+    text(int((width() - w) / 2), 6, parts)
+  end
+end
+
+return We4ther()
