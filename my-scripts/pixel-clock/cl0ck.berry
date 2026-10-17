@@ -1,0 +1,29 @@
+# @name cl0ck
+# @desc Centered 24-hour clock with seconds, white text
+# @author github: jeremyeder
+# @version 1.0
+
+class Cl0ck
+
+  def draw()
+    clear()
+
+    var h = num(hour(), 0)
+    var m = num(minute(), 0)
+    var s = num(second(), 0)
+
+    var hh = h < 10 ? "0" + str(h) : str(h)
+    var mm = m < 10 ? "0" + str(m) : str(m)
+    var ss = s < 10 ? "0" + str(s) : str(s)
+
+    var value = hh + ":" + mm + ":" + ss
+
+    var w = text_ink_width(value)
+    var x = int((width() - w) / 2)
+
+    text(x, 6, value, 0xFFFFFF)
+  end
+
+end
+
+return Cl0ck()
