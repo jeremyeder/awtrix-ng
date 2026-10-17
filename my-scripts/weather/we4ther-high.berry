@@ -1,0 +1,34 @@
+# @name we4ther-high
+# @desc Today's high temperature, color gradient. Reads we4ther-temp's fetch
+# @author github: jeremyeder
+# @version 1.0
+# @requires we4therlib
+# @requires we4ther-temp
+
+import we4therlib
+
+class We4therHigh
+  var high
+
+  def init()
+    self.high = nil
+  end
+
+  def loop()
+    var age = shared.age("we4ther-temp.high")
+    self.high = (age == nil || age > 3600000) ? nil : shared.get("we4ther-temp.high")
+  end
+
+  def draw()
+    clear()
+    if self.high == nil
+      text(6, 6, "...", 0x666666)
+      return
+    end
+    var parts = we4therlib.screen("High", self.high)
+    var w = text_ink_width(parts)
+    text(int((width() - w) / 2), 6, parts)
+  end
+end
+
+return We4therHigh()

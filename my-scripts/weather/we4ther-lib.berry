@@ -1,0 +1,50 @@
+# @module we4therlib
+# @desc Shared settings and helpers for the we4ther-temp/low/high apps
+# @config lat number "Latitude" default=52.52 min=-90 max=90 step=0.0001
+# @config lon number "Longitude" default=13.40 min=-180 max=180 step=0.0001
+# @config unit select "Temperature unit" default=F options=C,F
+# @config every number "Refresh" default=15 min=15 max=60 unit=min
+
+var m = module("we4therlib")
+
+m.lat = store.get("lat")
+m.lon = store.get("lon")
+m.unit = store.get("unit")
+m.period = store.get("every") * 60
+
+# Colour stops: lower bound, colour - interpolated in between
+m.stops = [-12, 0xD977DF, -6, 0x9545BC, -1, 0x4B379C, 0, 0xFEC4FF,
+           4, 0x31B8DB, 10, 0x31DB8B, 15, 0x6ED228, 21, 0xFFFF28,
+           27, 0xF87E27, 32, 0xCF3927, 38, 0xA12527]
+
+m.color_for = def (v)
+  var s = m.stops
+  if v <= s[0] return s[1] end
+  var j = 0
+  while j < 20 && v >= s[j + 2]
+    j += 2
+  end
+  if j >= 20 return s[21] end
+  var a = s[j + 1]
+  var b = s[j + 3]
+  var f = (v - s[j]) * 1.0 / (s[j + 2] - s[j])
+  return rgb(int(a / 65536 % 256 + (b / 65536 % 256 - a / 65536 % 256) * f),
+             int(a / 256 % 256 + (b / 256 % 256 - a / 256 % 256) * f),
+             int(a % 256 + (b % 256 - a % 256) * f))
+end
+
+m.value_for = def (t)
+  # Converts a raw Celsius temperature to the module's configured unit
+  var v = m.unit == "F" ? t * 1.8 + 32 : t
+  return str(int(v + (v >= 0 ? 0.5 : -0.5))) + (m.unit == "F" ? "F" : "°")
+end
+
+m.screen = def (name, t)
+  # A 3-digit value ("100F") needs the space after the colon dropped,
+  # or the line runs a couple of pixels past the edge of the panel
+  var value = m.value_for(t)
+  var sep = size(value) >= 4 ? "" : " "
+  return [[name + ":" + sep, 0x888888], [value, m.color_for(t)]]
+end
+
+return m

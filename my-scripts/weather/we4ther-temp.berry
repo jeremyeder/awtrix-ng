@@ -1,0 +1,70 @@
+# @name we4ther-temp
+# @desc Current temperature, color gradient. Fetches for the we4ther-low/high apps too
+# @author github: jeremyeder
+# @version 1.0
+# @requires we4therlib
+
+import we4therlib
+
+class We4therTemp
+  var ticks, busy, raw
+
+  def init()
+    self.raw = store.get("temp")
+    self.ticks = 0
+    self.busy = false
+  end
+
+  def on_body(w, status)
+    self.busy = false
+    if w == nil return end
+    var m = re.search("_2m\":([-0-9.]+)", w)
+    var lo = re.search("temperature_2m_min\":\\[([-0-9.]+)", w)
+    var hi = re.search("temperature_2m_max\":\\[([-0-9.]+)", w)
+    if m == nil return end
+    var t = num(m[1])
+    if t == nil return end
+
+    self.raw = t
+    store.set("temp", self.raw)
+    shared.set("temp", self.raw)
+
+    if lo != nil
+      var v = num(lo[1])
+      if v != nil shared.set("low", v) end
+    end
+    if hi != nil
+      var v = num(hi[1])
+      if v != nil shared.set("high", v) end
+    end
+  end
+
+  def loop()
+    if self.ticks <= 0 && !self.busy
+      self.ticks = we4therlib.period
+      self.busy = true
+      http.get("http://api.open-meteo.com/v1/forecast" +
+               "?latitude=" + str(we4therlib.lat) +
+               "&longitude=" + str(we4therlib.lon) +
+               "&current=temperature_2m" +
+               "&daily=temperature_2m_max,temperature_2m_min" +
+               "&forecast_days=1&timeformat=unixtime&timezone=auto",
+               / b, st -> self.on_body(b, st),
+               {'find': "\"current\":", 'keep': 512})
+    end
+    self.ticks -= 1
+  end
+
+  def draw()
+    clear()
+    if self.raw == nil
+      text(6, 6, "...", 0x666666)
+      return
+    end
+    var parts = we4therlib.screen("Temp", self.raw)
+    var w = text_ink_width(parts)
+    text(int((width() - w) / 2), 6, parts)
+  end
+end
+
+return We4therTemp()
