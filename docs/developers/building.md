@@ -210,6 +210,34 @@ container*, which `-p 8080:8080` can't reach from the host - the container start
 request from outside is refused. `ctest --preset host --parallel 8` and any other `host` preset
 target build and run the same way, inside the same container.
 
+#### Running multiple clocks
+
+Every `awtrix-linux` instance is independent, keyed only by its `--data` directory and `--port`
+- so running several at once (to develop something that coordinates multiple displays, say) just
+means giving each its own. The `uid` in `GET /api/v1/device` comes from `--data`: two instances
+sharing a directory would share an identity too.
+
+On Linux, that's just another invocation:
+
+```bash
+build/host/awtrix-linux --data "$HOME/.local/share/awtrix-ng-dev-b" --port 8081 \
+  --webui "$PWD/webui/index.html"
+```
+
+On macOS, give the second instance its own container, port, and volume, reusing the same image:
+
+```bash
+docker run -d --name awtrix-linux-dev-b -p 8081:8081 \
+  -v "$PWD":/repo -w /repo \
+  -v awtrix-linux-dev-b-data:/data \
+  awtrix-linux-dev \
+  ./build/host/awtrix-linux --data /data --port 8081 --webui /repo/webui/index.html \
+  --lan --listen 0.0.0.0
+```
+
+Each is then reachable on its own port (`http://127.0.0.1:8080`, `http://127.0.0.1:8081`, …)
+with its own live preview, API and persistent state.
+
 | Preset | Toolchain | Builds |
 |---|---|---|
 | `host` | the machine's compiler | `awtrix-linux` and every regression test |
