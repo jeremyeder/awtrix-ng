@@ -1,0 +1,243 @@
+# @module sc0relib
+# @desc Shared ESPN fetch/parse/format helpers for the team score apps
+
+import string
+
+var m = module("sc0relib")
+
+m.paths = {
+  "mlb": "baseball/mlb",
+  "nba": "basketball/nba",
+  "nhl": "hockey/nhl",
+  "nfl": "football/nfl",
+}
+
+# The ESPN team endpoint is scoped to one team's next/current game, so it stays
+# small (~20KB) no matter how many other games are on that day's slate - unlike
+# the league scoreboard, which lists every game and is too big to scan safely.
+m.url = def (sport, abbr)
+  return "https://site.api.espn.com/apis/site/v2/sports/" + m.paths[sport] +
+         "/teams/" + string.tolower(abbr)
+end
+
+# A single contiguous "keep" window big enough to span both competitors plus
+# game status turned out to be unreliable on-device somewhere above ~10KB
+# (confirmed by direct testing: identical requests with keep=12000 silently
+# returned a nil body while keep=10000 worked) - and the window needed keeps
+# growing per-team anyway, since each competitor's "team" object carries a
+# full links/logos array (1-2KB+) that sits between its own score/abbreviation
+# and whatever comes next. So instead of one big fetch, pull three small,
+# fixed-size, reliably-sized chunks, each anchored right where its data
+# starts - cheap on memory and independent of how bloated the broadcast/logo
+# arrays are for any given matchup. "cap" (scan window for the anchor itself)
+# is unaffected by this ceiling and can stay generous.
+m.CAP = 24000
+m.ANCHOR_LEAD = {"find": "\"nextEvent\":[{", "keep": 800, "cap": m.CAP}
+m.ANCHOR_COMP2 = {"find": "},{\"homeAway\"", "keep": 200, "cap": m.CAP}
+m.ANCHOR_STATUS = {"find": "\"status\":{\"clock\"", "keep": 400, "cap": m.CAP}
+
+# Parses one competitor's chunk (abbreviation + optional score - ESPN omits
+# "score" entirely until the game starts) into {abbr, score}, or nil.
+m.parse_competitor = def (chunk)
+  var a = re.search("\"abbreviation\":\"([A-Za-z]+)\"", chunk)
+  if a == nil return nil end
+  var pos = string.find(chunk, a[0])
+  var before = chunk[0..pos - 1]
+  var s = re.search("\"score\":{\"displayValue\":\"([^\"]*)\"", before)
+  return {"abbr": a[1], "score": s != nil ? s[1] : nil}
+end
+
+# Parses the lead chunk (from "nextEvent") into the broadcast network name and
+# the first (home) competitor.
+m.parse_lead = def (chunk)
+  var net = re.search("\"shortName\":\"([^\"]+)\"", chunk)
+  var comp = m.parse_competitor(chunk)
+  if comp == nil return nil end
+  return {"network": net != nil ? net[1] : nil, "comp": comp}
+end
+
+# Parses the game status chunk into state/period/clock/detail/shortDetail.
+m.parse_status = def (chunk)
+  var info = {}
+  var st = re.search("\"state\":\"([a-z]+)\"", chunk)
+  info["state"] = st != nil ? st[1] : "pre"
+
+  var per = re.search("\"period\":([0-9]+)", chunk)
+  info["period"] = per != nil ? int(per[1]) : 0
+
+  var clk = re.search("\"displayClock\":\"([^\"]*)\"", chunk)
+  info["clock"] = clk != nil ? clk[1] : "0:00"
+
+  var det = re.search("\"detail\":\"([^\"]*)\"", chunk)
+  info["detail"] = det != nil ? det[1] : ""
+
+  var sdet = re.search("\"shortDetail\":\"([^\"]*)\"", chunk)
+  info["short_detail"] = sdet != nil ? sdet[1] : info["detail"]
+
+  return info
+end
+
+# Combines the three parsed pieces (lead/comp2/status) into the plain map
+# the apps render from, given which abbreviation is "mine".
+m.combine = def (lead, comp2, status, my_abbr)
+  if lead == nil || comp2 == nil || status == nil return nil end
+  var comp1 = lead["comp"]
+
+  var mine, theirs, opp_abbr
+  if comp1["abbr"] == my_abbr
+    mine = comp1["score"]
+    theirs = comp2["score"]
+    opp_abbr = comp2["abbr"]
+  else
+    mine = comp2["score"]
+    theirs = comp1["score"]
+    opp_abbr = comp1["abbr"]
+  end
+
+  var info = {}
+  info["network"] = lead["network"]
+  info["my_score"] = mine
+  info["opp_abbr"] = opp_abbr
+  info["opp_score"] = theirs
+  info["state"] = status["state"]
+  info["period"] = status["period"]
+  info["clock"] = status["clock"]
+  info["detail"] = status["detail"]
+  info["short_detail"] = status["short_detail"]
+  return info
+end
+
+# Compact period/clock label for a live game. Pre/post games just use ESPN's
+# own short_detail text ("10/18 - 1:00 PM EDT", "Final", "Final/OT", ...).
+m.period_label = def (sport, info)
+  var state = info["state"]
+  if state != "in" return info["short_detail"] end
+
+  var p = info["period"]
+  var clock = info["clock"]
+
+  if sport == "mlb"
+    var half = re.search("(Top|Bot|Mid|End) ([0-9]+)", info["detail"])
+    if half == nil return info["short_detail"] end
+    var letter = "?"
+    if half[1] == "Top" letter = "T"
+    elif half[1] == "Bot" letter = "B"
+    elif half[1] == "Mid" letter = "M"
+    elif half[1] == "End" letter = "E"
+    end
+    return letter + half[2]
+  elif sport == "nhl"
+    if p <= 3 return "P" + str(p) + " " + clock
+    elif p == 4 return "OT " + clock
+    else return "SO" end
+  else # nfl, nba
+    if p <= 4 return "Q" + str(p) + " " + clock
+    else return "OT " + clock end
+  end
+end
+
+# Score color: green ahead, red behind, yellow tied. White once no numbers yet.
+m.color = def (mine, theirs)
+  var a = num(mine)
+  var b = num(theirs)
+  if a == nil || b == nil return 0xFFFFFF end
+  if a > b return 0x00CC44 end
+  if a < b return 0xCC2222 end
+  return 0xCCCC00
+end
+
+# Full app behavior (fetch/loop/draw) shared by every team. Each team's
+# @script is just `return sc0relib.make("<ABBR>", "<sport>")` - the
+# abbr/sport pair is the only thing that differs between teams.
+class _TeamApp
+  var abbr, sport, ticks, busy, info, lead, comp2
+
+  def init(abbr, sport)
+    self.abbr = abbr
+    self.sport = sport
+    self.ticks = 0
+    self.busy = false
+    self.info = store.get("info")
+  end
+
+  # Three chained fetches to the same URL: lead (network + home competitor),
+  # then away competitor, then status. Each keep is small and reliable; see
+  # the comment above m.ANCHOR_LEAD for why one big fetch isn't.
+  def fetch_lead()
+    http.get(m.url(self.sport, self.abbr),
+             / b, st -> self.on_lead(b, st),
+             m.ANCHOR_LEAD)
+  end
+
+  def on_lead(b, st)
+    if b == nil self.busy = false return end
+    self.lead = m.parse_lead(b)
+    if self.lead == nil self.busy = false return end
+    http.get(m.url(self.sport, self.abbr),
+             / b2, st2 -> self.on_comp2(b2, st2),
+             m.ANCHOR_COMP2)
+  end
+
+  def on_comp2(b, st)
+    if b == nil self.busy = false return end
+    self.comp2 = m.parse_competitor(b)
+    if self.comp2 == nil self.busy = false return end
+    http.get(m.url(self.sport, self.abbr),
+             / b2, st2 -> self.on_status(b2, st2),
+             m.ANCHOR_STATUS)
+  end
+
+  def on_status(b, st)
+    self.busy = false
+    if b == nil return end
+    var status = m.parse_status(b)
+    var i = m.combine(self.lead, self.comp2, status, self.abbr)
+    if i == nil return end
+    self.info = i
+    store.set("info", i)
+  end
+
+  def loop()
+    if self.ticks <= 0 && !self.busy
+      self.ticks = self.info != nil && self.info["state"] == "in" ? 60 : 300
+      self.busy = true
+      self.fetch_lead()
+    end
+    self.ticks -= 1
+  end
+
+  def draw()
+    clear()
+    if self.info == nil
+      text(6, 6, "...", 0x666666)
+      return
+    end
+
+    var state = self.info["state"]
+    var parts = [[self.abbr + " ", 0x888888]]
+
+    if state == "pre"
+      parts.push(["vs " + self.info["opp_abbr"] + "  ", 0xFFFFFF])
+      parts.push([self.info["short_detail"], 0xAAAAAA])
+      if self.info["network"] != nil
+        parts.push(["  " + self.info["network"], 0x4488FF])
+      end
+    else
+      var mine = self.info["my_score"] != nil ? self.info["my_score"] : "-"
+      var theirs = self.info["opp_score"] != nil ? self.info["opp_score"] : "-"
+      var c = m.color(self.info["my_score"], self.info["opp_score"])
+      parts.push([mine + "-" + theirs, c])
+      parts.push([" " + self.info["opp_abbr"] + "  ", 0x888888])
+      parts.push([m.period_label(self.sport, self.info), 0xFFFFFF])
+    end
+
+    scroll_text(parts, 0xFFFFFF)
+  end
+end
+
+# Factory: one instance per installed team app, sharing all logic above.
+m.make = def (abbr, sport)
+  return _TeamApp(abbr, sport)
+end
+
+return m
