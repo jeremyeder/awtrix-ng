@@ -1,0 +1,236 @@
+# @name    Wide Ticker
+# @desc    Scrolls one message across this panel and peer panels as one wide virtual display
+# @author  github: jeremyeder
+# @version 1.0
+# @config  peers      text   "Peer IPs, left to right, no spaces" default="" maxlen=256
+# @config  tickerText text   "Message"                            default="HELLO WORLD" maxlen=256
+# @config  textColor  color  "Text color"                         default=#FFFFFF
+# @config  speedPct   number "Scroll speed"                       default=100 min=10 max=400 unit="%"
+# @config  tickMs     number "Update interval"                    default=120 min=50 max=500 unit=ms
+# @config  appName    text   "Pushed app name created on peers"   default="wideticker" maxlen=32
+# @config  gapPx      number "Gap before the message repeats"     default=16 min=0 max=128 unit=px
+# @config  pinActive  bool   "Keep this active on every panel"    default=true
+
+import string
+import json
+
+class WideTicker
+  var peers        # list of peer IPs, in left-to-right order after this panel
+  var peer_ok       # ip -> bool, passed the size check and is currently live
+  var peer_fail     # ip -> consecutive push failures
+  var in_flight     # ip -> bool, a push is outstanding
+  var text_w        # cached scroll period in pixels (ink width + gap)
+  var start_ms      # now_ms() baseline the scroll position is measured from
+  var pin_ticks     # countdown of tick() calls until the next self-pin reassert
+  var visible       # true while this app is actually on screen on the master
+
+  def init()
+    self.peers = []
+    var raw = store.get("peers")
+    if raw != nil && size(raw) > 0
+      for p : string.split(raw, ",")
+        if size(p) > 0 self.peers.push(p) end
+      end
+    end
+
+    self.peer_ok = {}
+    self.peer_fail = {}
+    self.in_flight = {}
+    for ip : self.peers
+      self.peer_ok[ip] = false
+      self.peer_fail[ip] = 0
+      self.in_flight[ip] = false
+    end
+
+    self.text_w = text_ink_width(store.get("tickerText")) + int(store.get("gapPx"))
+    if self.text_w <= 0 self.text_w = 1 end
+    self.start_ms = now_ms()
+    self.pin_ticks = 0
+    self.visible = store.get("pinActive")   # a pinned app is always "on screen"
+  end
+
+  def setup()
+    for ip : self.peers
+      self.check_peer(ip)
+    end
+    timer.every(int(store.get("tickMs")), / -> self.tick())
+  end
+
+  # -- peer size validation, same precedent as built-in Mirroring --
+
+  def check_peer(ip)
+    self.in_flight[ip] = true
+    http.get("http://" + ip + "/api/v1/capabilities",
+             / b, st -> self.on_capabilities(ip, b, st),
+             {"find": "\"display\":", "keep": 96})
+  end
+
+  def on_capabilities(ip, b, st)
+    self.in_flight[ip] = false
+    if b == nil
+      log("wideticker: peer " + ip + " unreachable (status " + str(st) + ")")
+      return
+    end
+    var w = re.search("\"width\":([0-9]+)", b)
+    var h = re.search("\"height\":([0-9]+)", b)
+    if w == nil || h == nil
+      log("wideticker: peer " + ip + " capabilities unparsable")
+      return
+    end
+    var pw = num(w[1])
+    var ph = num(h[1])
+    if pw == width() && ph == height()
+      self.peer_ok[ip] = true
+      log("wideticker: peer " + ip + " ok (" + str(pw) + "x" + str(ph) + ")")
+      if !store.get("pinActive")
+        # Keep the pushed app out of this peer's OWN rotation in rotate mode -
+        # otherwise its independent autoTransition can land on it between our
+        # syncs and show a frozen, stale frame. Setting this by name works even
+        # before the app exists: it arrives already excluded, and on_show()/
+        # on_hide() toggle it only for the moment we actually need it shown.
+        self.set_enabled(ip, false)
+      end
+    else
+      log("wideticker: peer " + ip + " size mismatch (" + str(pw) + "x" + str(ph) + "), dropped")
+    end
+  end
+
+  def set_enabled(ip, on)
+    http.put("http://" + ip + "/api/v1/apps/" + store.get("appName") + "/enabled",
+             on ? "true" : "false",
+             / b, st -> nil,
+             {"headers": {"Content-Type": "application/json"}})
+  end
+
+  # -- virtual canvas: one global scroll position, clipped per panel --
+
+  def virtual_x()
+    var speed_px_ms = store.get("speedPct") / 100.0 * 21.0 / 1000.0
+    var elapsed = now_ms() - self.start_ms
+    var off = (elapsed * speed_px_ms) % self.text_w
+    return width() - off
+  end
+
+  def tick()
+    if !self.visible return end   # not our turn - nothing for peers to show yet
+
+    var vx = self.virtual_x()
+    var i = 1
+    for ip : self.peers
+      if self.peer_ok.find(ip, false) && !self.in_flight.find(ip, false)
+        self.push_to(ip, vx - i * width())
+      end
+      i += 1
+    end
+
+    if store.get("pinActive")
+      self.pin_ticks -= 1
+      if self.pin_ticks <= 0
+        self.pin_ticks = 40   # roughly every 40 ticks of the default 120 ms interval (~5 s)
+        self.reassert_active()
+      end
+    end
+  end
+
+  def push_to(ip, x)
+    self.in_flight[ip] = true
+    var body = json.dump({"draw": [["text", int(x), 1, store.get("tickerText"), store.get("textColor")]]})
+    http.put("http://" + ip + "/api/v1/apps/pushed/" + store.get("appName"), body,
+             / b, st -> self.on_pushed(ip, st),
+             {"headers": {"Content-Type": "application/json"}})
+  end
+
+  def on_pushed(ip, status)
+    self.in_flight[ip] = false
+    if status == 0
+      self.peer_fail[ip] = self.peer_fail.find(ip, 0) + 1
+      if self.peer_fail[ip] >= 5
+        self.peer_ok[ip] = false
+        log("wideticker: peer " + ip + " dropped after repeated failures")
+      end
+    else
+      self.peer_fail[ip] = 0
+    end
+  end
+
+  # Peers have no script of their own, so only an HTTP call can keep the
+  # pushed ticker app on screen there. The master's own panel only needs the
+  # orchestrator's one-time pin plus autoTransition:false (no self-HTTP-loop).
+  def reassert_active()
+    for ip : self.peers
+      if self.peer_ok.find(ip, false)
+        http.put("http://" + ip + "/api/v1/apps/active",
+                 json.dump({"name": store.get("appName"), "fast": true}),
+                 / b, st -> nil,
+                 {"headers": {"Content-Type": "application/json"}})
+      end
+    end
+  end
+
+  def loop()
+    # give a dropped peer a chance to rejoin once a second
+    for ip : self.peers
+      if !self.peer_ok.find(ip, false) && !self.in_flight.find(ip, false)
+        self.check_peer(ip)
+      end
+    end
+  end
+
+  # -- normal-rotation mode (pinActive=false): sync peers to our own turn --
+
+  def on_show()
+    self.visible = true
+    self.start_ms = now_ms()   # fresh pass each turn, not a drifting phase
+    if !store.get("pinActive")
+      for ip : self.peers
+        if self.peer_ok.find(ip, false)
+          self.activate_on(ip)
+        end
+      end
+    end
+  end
+
+  def activate_on(ip)
+    # enabled must flip back on before /apps/active will accept it - a
+    # switched-off app answers 404 there - so chain the two calls in order
+    http.put("http://" + ip + "/api/v1/apps/" + store.get("appName") + "/enabled", "true",
+             / b, st -> self.do_activate(ip),
+             {"headers": {"Content-Type": "application/json"}})
+  end
+
+  def do_activate(ip)
+    http.put("http://" + ip + "/api/v1/apps/active",
+             json.dump({"name": store.get("appName"), "fast": true}),
+             / b, st -> nil,
+             {"headers": {"Content-Type": "application/json"}})
+  end
+
+  def on_hide()
+    self.visible = false
+    if !store.get("pinActive")
+      for ip : self.peers
+        if self.peer_ok.find(ip, false)
+          # advance the peer off it first, then exclude it from that peer's
+          # own rotation again until our next turn
+          http.post("http://" + ip + "/api/v1/apps/next", nil,
+                    / b, st -> self.set_enabled(ip, false))
+        end
+      end
+    end
+  end
+
+  def duration()
+    # one full scroll pass, so a turn never cuts the message off mid-word -
+    # only meaningful in normal-rotation mode; pinned mode never hides anyway
+    var speed_px_ms = store.get("speedPct") / 100.0 * 21.0 / 1000.0
+    if speed_px_ms <= 0 return 0 end
+    return int(self.text_w / speed_px_ms)
+  end
+
+  def draw()
+    clear()
+    text(int(self.virtual_x()), 6, store.get("tickerText"), store.get("textColor"))
+  end
+end
+
+return WideTicker()
