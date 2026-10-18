@@ -23,6 +23,7 @@ class WideTicker
   var start_ms      # now_ms() baseline the scroll position is measured from
   var pin_ticks     # countdown of tick() calls until the next self-pin reassert
   var visible       # true while this app is actually on screen on the master
+  var json_headers  # built once: the opts map every JSON PUT/POST reuses
 
   def init()
     self.peers = []
@@ -46,7 +47,8 @@ class WideTicker
     if self.text_w <= 0 self.text_w = 1 end
     self.start_ms = now_ms()
     self.pin_ticks = 0
-    self.visible = store.get("pinActive")   # a pinned app is always "on screen"
+    self.visible = false
+    self.json_headers = {"headers": {"Content-Type": "application/json"}}
   end
 
   def setup()
@@ -83,12 +85,18 @@ class WideTicker
       self.peer_ok[ip] = true
       log("wideticker: peer " + ip + " ok (" + str(pw) + "x" + str(ph) + ")")
       if !store.get("pinActive")
-        # Keep the pushed app out of this peer's OWN rotation in rotate mode -
-        # otherwise its independent autoTransition can land on it between our
-        # syncs and show a frozen, stale frame. Setting this by name works even
-        # before the app exists: it arrives already excluded, and on_show()/
-        # on_hide() toggle it only for the moment we actually need it shown.
-        self.set_enabled(ip, false)
+        if self.visible
+          # Our turn is already showing (this peer just reconnected mid-turn) -
+          # catch it up now instead of leaving it excluded until the next cycle.
+          self.activate_on(ip)
+        else
+          # Keep the pushed app out of this peer's OWN rotation in rotate mode -
+          # otherwise its independent autoTransition can land on it between our
+          # syncs and show a frozen, stale frame. Setting this by name works even
+          # before the app exists: it arrives already excluded, and on_show()/
+          # on_hide() toggle it only for the moment we actually need it shown.
+          self.set_enabled(ip, false)
+        end
       end
     else
       log("wideticker: peer " + ip + " size mismatch (" + str(pw) + "x" + str(ph) + "), dropped")
@@ -97,9 +105,13 @@ class WideTicker
 
   def set_enabled(ip, on)
     http.put("http://" + ip + "/api/v1/apps/" + store.get("appName") + "/enabled",
-             on ? "true" : "false",
-             / b, st -> nil,
-             {"headers": {"Content-Type": "application/json"}})
+             on ? "true" : "false", / b, st -> nil, self.json_headers)
+  end
+
+  def peer_active(ip)
+    http.put("http://" + ip + "/api/v1/apps/active",
+             json.dump({"name": store.get("appName"), "fast": true}),
+             / b, st -> nil, self.json_headers)
   end
 
   # -- virtual canvas: one global scroll position, clipped per panel --
@@ -112,7 +124,8 @@ class WideTicker
   end
 
   def tick()
-    if !self.visible return end   # not our turn - nothing for peers to show yet
+    # pinned mode is always "our turn"; rotate mode only while actually shown
+    if !store.get("pinActive") && !self.visible return end
 
     var vx = self.virtual_x()
     var i = 1
@@ -136,8 +149,7 @@ class WideTicker
     self.in_flight[ip] = true
     var body = json.dump({"draw": [["text", int(x), 1, store.get("tickerText"), store.get("textColor")]]})
     http.put("http://" + ip + "/api/v1/apps/pushed/" + store.get("appName"), body,
-             / b, st -> self.on_pushed(ip, st),
-             {"headers": {"Content-Type": "application/json"}})
+             / b, st -> self.on_pushed(ip, st), self.json_headers)
   end
 
   def on_pushed(ip, status)
@@ -159,10 +171,7 @@ class WideTicker
   def reassert_active()
     for ip : self.peers
       if self.peer_ok.find(ip, false)
-        http.put("http://" + ip + "/api/v1/apps/active",
-                 json.dump({"name": store.get("appName"), "fast": true}),
-                 / b, st -> nil,
-                 {"headers": {"Content-Type": "application/json"}})
+        self.peer_active(ip)
       end
     end
   end
@@ -194,15 +203,7 @@ class WideTicker
     # enabled must flip back on before /apps/active will accept it - a
     # switched-off app answers 404 there - so chain the two calls in order
     http.put("http://" + ip + "/api/v1/apps/" + store.get("appName") + "/enabled", "true",
-             / b, st -> self.do_activate(ip),
-             {"headers": {"Content-Type": "application/json"}})
-  end
-
-  def do_activate(ip)
-    http.put("http://" + ip + "/api/v1/apps/active",
-             json.dump({"name": store.get("appName"), "fast": true}),
-             / b, st -> nil,
-             {"headers": {"Content-Type": "application/json"}})
+             / b, st -> self.peer_active(ip), self.json_headers)
   end
 
   def on_hide()
