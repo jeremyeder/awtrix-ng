@@ -1,0 +1,9 @@
+# @name jets
+# @desc New York Jets score, via ESPN
+# @author github: jeremyeder
+# @version 1.1
+# @requires sc0relib
+
+import sc0relib
+
+return sc0relib.make("NYJ", "nfl")
