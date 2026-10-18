@@ -2,7 +2,7 @@
 # @desc    Scrolls one message across this panel and peer panels as one wide virtual display
 # @author  github: jeremyeder
 # @version 1.0
-# @config  peers      text   "Peer IPs, left to right, no spaces" default="" maxlen=256
+# @config  peers      text   "Peers, left to right, no spaces" default="" maxlen=256 help="Comma-separated: IP or label=IP (e.g. awtrix-1=192.168.1.21,awtrix-2=192.168.1.22)."
 # @config  tickerText text   "Message"                            default="HELLO WORLD" maxlen=256
 # @config  textColor  color  "Text color"                         default=#FFFFFF
 # @config  speedPct   number "Scroll speed"                       default=100 min=10 max=400 unit="%"
@@ -16,6 +16,7 @@ import json
 
 class WideTicker
   var peers        # list of peer IPs, in left-to-right order after this panel
+  var peer_label    # ip -> display label, for log() lines (defaults to the ip itself)
   var peer_ok       # ip -> bool, passed the size check and is currently live
   var peer_fail     # ip -> consecutive push failures
   var in_flight     # ip -> bool, a push is outstanding
@@ -27,10 +28,16 @@ class WideTicker
 
   def init()
     self.peers = []
+    self.peer_label = {}
     var raw = store.get("peers")
     if raw != nil && size(raw) > 0
-      for p : string.split(raw, ",")
-        if size(p) > 0 self.peers.push(p) end
+      for entry : string.split(raw, ",")
+        if size(entry) == 0 continue end
+        var eq = string.find(entry, "=")
+        var ip = eq < 0 ? entry : entry[eq + 1 .. size(entry) - 1]
+        var label = eq < 0 ? entry : entry[0 .. eq - 1]
+        self.peers.push(ip)
+        self.peer_label[ip] = label
       end
     end
 
@@ -69,21 +76,22 @@ class WideTicker
 
   def on_capabilities(ip, b, st)
     self.in_flight[ip] = false
+    var label = self.peer_label.find(ip, ip)
     if b == nil
-      log("wideticker: peer " + ip + " unreachable (status " + str(st) + ")")
+      log("wideticker: peer " + label + " unreachable (status " + str(st) + ")")
       return
     end
     var w = re.search("\"width\":([0-9]+)", b)
     var h = re.search("\"height\":([0-9]+)", b)
     if w == nil || h == nil
-      log("wideticker: peer " + ip + " capabilities unparsable")
+      log("wideticker: peer " + label + " capabilities unparsable")
       return
     end
     var pw = num(w[1])
     var ph = num(h[1])
     if pw == width() && ph == height()
       self.peer_ok[ip] = true
-      log("wideticker: peer " + ip + " ok (" + str(pw) + "x" + str(ph) + ")")
+      log("wideticker: peer " + label + " ok (" + str(pw) + "x" + str(ph) + ")")
       if !store.get("pinActive")
         if self.visible
           # Our turn is already showing (this peer just reconnected mid-turn) -
@@ -99,7 +107,7 @@ class WideTicker
         end
       end
     else
-      log("wideticker: peer " + ip + " size mismatch (" + str(pw) + "x" + str(ph) + "), dropped")
+      log("wideticker: peer " + label + " size mismatch (" + str(pw) + "x" + str(ph) + "), dropped")
     end
   end
 
@@ -158,7 +166,7 @@ class WideTicker
       self.peer_fail[ip] = self.peer_fail.find(ip, 0) + 1
       if self.peer_fail[ip] >= 5
         self.peer_ok[ip] = false
-        log("wideticker: peer " + ip + " dropped after repeated failures")
+        log("wideticker: peer " + self.peer_label.find(ip, ip) + " dropped after repeated failures")
       end
     else
       self.peer_fail[ip] = 0
