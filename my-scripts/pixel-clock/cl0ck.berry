@@ -1,27 +1,42 @@
-# @name cl0ck
-# @desc Centered 24-hour clock with seconds, white text
-# @author github: jeremyeder
-# @version 1.0
+# @name    cl0ck
+# @desc    Centered clock, configurable 12h/24h format, seconds and color
+# @author  github: jeremyeder
+# @version 1.1
+# @config  format      select "Format"       default=24h options=12h,24h
+# @config  showSeconds bool   "Show seconds" default=true
+# @config  textColor   color  "Text color"   default=#FFFFFF
 
 class Cl0ck
 
   def draw()
     clear()
 
+    var is12h = store.get("format") == "12h"
     var h = num(hour(), 0)
     var m = num(minute(), 0)
     var s = num(second(), 0)
+    var suffix = ""
 
-    var hh = h < 10 ? "0" + str(h) : str(h)
+    if is12h
+      suffix = h < 12 ? "A" : "P"
+      h = h % 12
+      if h == 0 h = 12 end
+    end
+
+    var hh = (!is12h && h < 10) ? "0" + str(h) : str(h)
     var mm = m < 10 ? "0" + str(m) : str(m)
-    var ss = s < 10 ? "0" + str(s) : str(s)
 
-    var value = hh + ":" + mm + ":" + ss
+    var value = hh + ":" + mm
+    if store.get("showSeconds")
+      var ss = s < 10 ? "0" + str(s) : str(s)
+      value = value + ":" + ss
+    end
+    value = value + suffix
 
     var w = text_ink_width(value)
     var x = int((width() - w) / 2)
 
-    text(x, 6, value, 0xFFFFFF)
+    text(x, 6, value, store.get("textColor"))
   end
 
 end
