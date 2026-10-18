@@ -174,6 +174,42 @@ Then open **http://127.0.0.1:8080**. It listens on loopback only. The flags and 
 described in [AWTRIX on Linux](site:tc002/developers/linux/). The TC002 release, built for ARM with the `tc002`
 and `tc002-loader` presets, is described in the [TC002 developer guide](site:tc002/developers/tc002/).
 
+#### macOS
+
+`CMakeLists.txt` refuses to configure on macOS (`if(NOT UNIX OR APPLE) ... FATAL_ERROR`), so
+build and run `awtrix-linux` inside a Linux container instead - no cross-compiler needed, since
+the image only runs locally:
+
+```bash
+cat > Dockerfile.linux-dev <<'EOF'
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build libssl-dev liblzma-dev libjpeg-turbo8-dev \
+    openssl mosquitto python3 python3-pip git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /repo
+EOF
+docker build -t awtrix-linux-dev -f Dockerfile.linux-dev .
+
+pio pkg install -e native
+docker run --rm -v "$PWD":/repo -w /repo awtrix-linux-dev bash -c "
+  cmake --preset host
+  cmake --build --preset host --parallel
+"
+
+docker run -d --name awtrix-linux-dev -p 8080:8080 \
+  -v "$PWD":/repo -w /repo \
+  -v awtrix-linux-dev-data:/data \
+  awtrix-linux-dev \
+  ./build/host/awtrix-linux --data /data --port 8080 --webui /repo/webui/index.html \
+  --lan --listen 0.0.0.0
+```
+
+`--lan --listen 0.0.0.0` is required: without it, the bind stays loopback-only *inside the
+container*, which `-p 8080:8080` can't reach from the host - the container starts fine, but every
+request from outside is refused. `ctest --preset host --parallel 8` and any other `host` preset
+target build and run the same way, inside the same container.
+
 | Preset | Toolchain | Builds |
 |---|---|---|
 | `host` | the machine's compiler | `awtrix-linux` and every regression test |
