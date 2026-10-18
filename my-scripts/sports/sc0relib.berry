@@ -1,9 +1,16 @@
 # @module sc0relib
 # @desc Shared ESPN fetch/parse/format helpers for the team score apps
+# @config everyLive number "Refresh while live"     default=60  min=15  max=300  unit=s
+# @config everyIdle number "Refresh otherwise"      default=300 min=60  max=3600 unit=s
+# @config onlyToday bool   "Only show if playing today" default=true
 
 import string
 
 var m = module("sc0relib")
+
+m.every_live = store.get("everyLive")
+m.every_idle = store.get("everyIdle")
+m.only_today = store.get("onlyToday")
 
 m.paths = {
   "mlb": "baseball/mlb",
@@ -59,6 +66,12 @@ m.parse_status = def (chunk)
   var sdet = re.search("\"shortDetail\":\"([^\"]*)\"", chunk)
   info["short_detail"] = sdet != nil ? sdet[1] : info["detail"]
   info["is_today"] = m.event_is_today(chunk, info["short_detail"])
+  # Parsed ourselves, not trusted to ESPN's shortDetail: a far-future game
+  # with no confirmed time answers "TBD" with no date at all, which reads
+  # as today's game when onlyToday is off. "date" is in every chunk
+  # (ANCHOR_STATUS is anchored right at it).
+  var dt = re.search("\"date\":\"[0-9]+-([0-9]+)-([0-9]+)T", chunk)
+  info["event_date"] = dt != nil ? str(int(dt[1])) + "/" + str(int(dt[2])) : nil
   return info
 end
 
@@ -108,6 +121,7 @@ m.combine = def (lead, comp2, status, my_abbr)
     "state": status["state"], "period": status["period"],
     "clock": status["clock"], "detail": status["detail"],
     "short_detail": status["short_detail"], "is_today": status["is_today"],
+    "event_date": status["event_date"],
   }
 end
 
@@ -189,7 +203,7 @@ class _TeamApp
 
   def loop()
     if self.ticks <= 0 && !self.busy
-      self.ticks = self.info != nil && self.info["state"] == "in" ? 60 : 300
+      self.ticks = self.info != nil && self.info["state"] == "in" ? m.every_live : m.every_idle
       self.busy = true
       self.fetch_lead()
     end
@@ -198,10 +212,11 @@ class _TeamApp
 
   # Only show a team that's live, just finished, or playing today - not
   # whatever game ESPN's "next scheduled" happens to point at (which, in
-  # the offseason, can be months out). Show the loading dots rather than
-  # hiding outright while data isn't in yet.
+  # the offseason, can be months out) - unless onlyToday is switched off.
+  # Show the loading dots rather than hiding outright while data isn't in yet.
   def should_show()
     if self.info == nil return true end
+    if !m.only_today return true end
     var state = self.info["state"]
     return state == "in" || state == "post" || self.info.find("is_today", true)
   end
@@ -216,6 +231,14 @@ class _TeamApp
     var parts = [[self.abbr + " ", 0x888888]]
     if self.info["state"] == "pre"
       parts.push(["vs " + self.info["opp_abbr"] + "  ", 0xFFFFFF])
+      # Only onlyToday=false can ever surface a future game here, and
+      # ESPN's own short_detail isn't reliable for one: a confirmed date
+      # shows "10/20 - 7:00 PM EDT", but a far-future unscheduled game is
+      # just "TBD" with no date at all - indistinguishable from today's
+      # game without this.
+      if !self.info["is_today"] && self.info["event_date"] != nil
+        parts.push([self.info["event_date"] + " ", 0xFFAA00])
+      end
       parts.push([self.info["short_detail"], 0xAAAAAA])
       if self.info["network"] != nil
         parts.push(["  " + self.info["network"], 0x4488FF])
