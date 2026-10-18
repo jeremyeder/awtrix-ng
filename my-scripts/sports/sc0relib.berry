@@ -12,43 +12,33 @@ m.paths = {
   "nfl": "football/nfl",
 }
 
-# The ESPN team endpoint is scoped to one team's next/current game, so it stays
-# small (~20KB) no matter how many other games are on that day's slate - unlike
-# the league scoreboard, which lists every game and is too big to scan safely.
+# Team-scoped endpoint: stays small regardless of the day's full schedule.
 m.url = def (sport, abbr)
   return "https://site.api.espn.com/apis/site/v2/sports/" + m.paths[sport] +
          "/teams/" + string.tolower(abbr)
 end
 
-# A single contiguous "keep" window big enough to span both competitors plus
-# game status turned out to be unreliable on-device somewhere above ~10KB
-# (confirmed by direct testing: identical requests with keep=12000 silently
-# returned a nil body while keep=10000 worked) - and the window needed keeps
-# growing per-team anyway, since each competitor's "team" object carries a
-# full links/logos array (1-2KB+) that sits between its own score/abbreviation
-# and whatever comes next. So instead of one big fetch, pull three small,
-# fixed-size, reliably-sized chunks, each anchored right where its data
-# starts - cheap on memory and independent of how bloated the broadcast/logo
-# arrays are for any given matchup. "cap" (scan window for the anchor itself)
-# is unaffected by this ceiling and can stay generous.
+# One keep spanning both competitors+status was unreliable above ~10KB on
+# device (keep=12000 nil'd the body, keep=10000 didn't) and kept growing
+# per-team anyway (each competitor's "team" object has a links/logos array
+# before whatever's next). So: 3 small, independently-anchored fetches.
 m.CAP = 24000
 m.ANCHOR_LEAD = {"find": "\"nextEvent\":[{", "keep": 800, "cap": m.CAP}
 m.ANCHOR_COMP2 = {"find": "},{\"homeAway\"", "keep": 200, "cap": m.CAP}
-m.ANCHOR_STATUS = {"find": "\"status\":{\"clock\"", "keep": 400, "cap": m.CAP}
+# Competitors close straight into date,id,neutralSite,notes,status; anchor
+# here (not "status":{"clock) since far-future TBD games lack a clock key.
+m.ANCHOR_STATUS = {"find": "}],\"date\":\"", "keep": 550, "cap": m.CAP}
 
-# Parses one competitor's chunk (abbreviation + optional score - ESPN omits
-# "score" entirely until the game starts) into {abbr, score}, or nil.
+# {abbr, score} for one competitor chunk. ESPN omits "score" until the game
+# starts, so it's nil pre-game.
 m.parse_competitor = def (chunk)
   var a = re.search("\"abbreviation\":\"([A-Za-z]+)\"", chunk)
   if a == nil return nil end
   var pos = string.find(chunk, a[0])
-  var before = chunk[0..pos - 1]
-  var s = re.search("\"score\":{\"displayValue\":\"([^\"]*)\"", before)
+  var s = re.search("\"score\":{\"displayValue\":\"([^\"]*)\"", chunk[0..pos - 1])
   return {"abbr": a[1], "score": s != nil ? s[1] : nil}
 end
 
-# Parses the lead chunk (from "nextEvent") into the broadcast network name and
-# the first (home) competitor.
 m.parse_lead = def (chunk)
   var net = re.search("\"shortName\":\"([^\"]+)\"", chunk)
   var comp = m.parse_competitor(chunk)
@@ -56,66 +46,77 @@ m.parse_lead = def (chunk)
   return {"network": net != nil ? net[1] : nil, "comp": comp}
 end
 
-# Parses the game status chunk into state/period/clock/detail/shortDetail.
 m.parse_status = def (chunk)
   var info = {}
   var st = re.search("\"state\":\"([a-z]+)\"", chunk)
   info["state"] = st != nil ? st[1] : "pre"
-
   var per = re.search("\"period\":([0-9]+)", chunk)
   info["period"] = per != nil ? int(per[1]) : 0
-
   var clk = re.search("\"displayClock\":\"([^\"]*)\"", chunk)
   info["clock"] = clk != nil ? clk[1] : "0:00"
-
   var det = re.search("\"detail\":\"([^\"]*)\"", chunk)
   info["detail"] = det != nil ? det[1] : ""
-
   var sdet = re.search("\"shortDetail\":\"([^\"]*)\"", chunk)
   info["short_detail"] = sdet != nil ? sdet[1] : info["detail"]
-
+  info["is_today"] = m.event_is_today(chunk, info["short_detail"])
   return info
 end
 
-# Combines the three parsed pieces (lead/comp2/status) into the plain map
-# the apps render from, given which abbreviation is "mine".
+# Julian day number: compares calendar days across month/year rollover.
+m.jdn = def (y, mo, d)
+  var a = int((14 - mo) / 12)
+  var y2 = y + 4800 - a
+  var m2 = mo + 12 * a - 3
+  return d + int((153 * m2 + 2) / 5) + 365 * y2 + int(y2 / 4) - int(y2 / 100) +
+         int(y2 / 400) - 32045
+end
+
+# ESPN's detail text names its own zone, no need for the device's UTC
+# offset. Defaults to EDT when absent (only matters for far-future games).
+m.ZONE_OFFSETS = {
+  "EDT": -4, "EST": -5, "CDT": -5, "CST": -6,
+  "MDT": -6, "MST": -7, "PDT": -7, "PST": -8,
+}
+m.zone_offset = def (text)
+  var zm = re.search("(EDT|EST|CDT|CST|MDT|MST|PDT|PST)", text)
+  if zm == nil return -4 end
+  var off = m.ZONE_OFFSETS[zm[1]]
+  return off != nil ? off : -4
+end
+
+m.event_is_today = def (chunk, zone_text)
+  var dt = re.search("\"date\":\"([0-9]+)-([0-9]+)-([0-9]+)T([0-9]+):", chunk)
+  if dt == nil return false end
+  var jdn = m.jdn(int(dt[1]), int(dt[2]), int(dt[3]))
+  var h = int(dt[4]) + m.zone_offset(zone_text)
+  if h < 0 jdn -= 1 elif h >= 24 jdn += 1 end
+  return jdn == m.jdn(year(), month(), day())
+end
+
 m.combine = def (lead, comp2, status, my_abbr)
   if lead == nil || comp2 == nil || status == nil return nil end
   var comp1 = lead["comp"]
-
   var mine, theirs, opp_abbr
   if comp1["abbr"] == my_abbr
-    mine = comp1["score"]
-    theirs = comp2["score"]
-    opp_abbr = comp2["abbr"]
+    mine = comp1["score"] theirs = comp2["score"] opp_abbr = comp2["abbr"]
   else
-    mine = comp2["score"]
-    theirs = comp1["score"]
-    opp_abbr = comp1["abbr"]
+    mine = comp2["score"] theirs = comp1["score"] opp_abbr = comp1["abbr"]
   end
-
-  var info = {}
-  info["network"] = lead["network"]
-  info["my_score"] = mine
-  info["opp_abbr"] = opp_abbr
-  info["opp_score"] = theirs
-  info["state"] = status["state"]
-  info["period"] = status["period"]
-  info["clock"] = status["clock"]
-  info["detail"] = status["detail"]
-  info["short_detail"] = status["short_detail"]
-  return info
+  return {
+    "network": lead["network"], "my_score": mine,
+    "opp_abbr": opp_abbr, "opp_score": theirs,
+    "state": status["state"], "period": status["period"],
+    "clock": status["clock"], "detail": status["detail"],
+    "short_detail": status["short_detail"], "is_today": status["is_today"],
+  }
 end
 
-# Compact period/clock label for a live game. Pre/post games just use ESPN's
-# own short_detail text ("10/18 - 1:00 PM EDT", "Final", "Final/OT", ...).
+# Compact period/clock label for a live game; pre/post games use ESPN's own
+# short_detail ("10/18 - 1:00 PM EDT", "Final", "Final/OT", ...).
 m.period_label = def (sport, info)
-  var state = info["state"]
-  if state != "in" return info["short_detail"] end
-
+  if info["state"] != "in" return info["short_detail"] end
   var p = info["period"]
   var clock = info["clock"]
-
   if sport == "mlb"
     var half = re.search("(Top|Bot|Mid|End) ([0-9]+)", info["detail"])
     if half == nil return info["short_detail"] end
@@ -136,7 +137,7 @@ m.period_label = def (sport, info)
   end
 end
 
-# Score color: green ahead, red behind, yellow tied. White once no numbers yet.
+# Score color: green ahead, red behind, yellow tied, white if no score yet.
 m.color = def (mine, theirs)
   var a = num(mine)
   var b = num(theirs)
@@ -146,9 +147,8 @@ m.color = def (mine, theirs)
   return 0xCCCC00
 end
 
-# Full app behavior (fetch/loop/draw) shared by every team. Each team's
-# @script is just `return sc0relib.make("<ABBR>", "<sport>")` - the
-# abbr/sport pair is the only thing that differs between teams.
+# Shared app behavior. Each team's @script is just
+# `return sc0relib.make("<ABBR>", "<sport>")`.
 class _TeamApp
   var abbr, sport, ticks, busy, info, lead, comp2
 
@@ -160,38 +160,28 @@ class _TeamApp
     self.info = store.get("info")
   end
 
-  # Three chained fetches to the same URL: lead (network + home competitor),
-  # then away competitor, then status. Each keep is small and reliable; see
-  # the comment above m.ANCHOR_LEAD for why one big fetch isn't.
   def fetch_lead()
-    http.get(m.url(self.sport, self.abbr),
-             / b, st -> self.on_lead(b, st),
-             m.ANCHOR_LEAD)
+    http.get(m.url(self.sport, self.abbr), / b, st -> self.on_lead(b, st), m.ANCHOR_LEAD)
   end
 
   def on_lead(b, st)
     if b == nil self.busy = false return end
     self.lead = m.parse_lead(b)
     if self.lead == nil self.busy = false return end
-    http.get(m.url(self.sport, self.abbr),
-             / b2, st2 -> self.on_comp2(b2, st2),
-             m.ANCHOR_COMP2)
+    http.get(m.url(self.sport, self.abbr), / b2, st2 -> self.on_comp2(b2, st2), m.ANCHOR_COMP2)
   end
 
   def on_comp2(b, st)
     if b == nil self.busy = false return end
     self.comp2 = m.parse_competitor(b)
     if self.comp2 == nil self.busy = false return end
-    http.get(m.url(self.sport, self.abbr),
-             / b2, st2 -> self.on_status(b2, st2),
-             m.ANCHOR_STATUS)
+    http.get(m.url(self.sport, self.abbr), / b2, st2 -> self.on_status(b2, st2), m.ANCHOR_STATUS)
   end
 
   def on_status(b, st)
     self.busy = false
     if b == nil return end
-    var status = m.parse_status(b)
-    var i = m.combine(self.lead, self.comp2, status, self.abbr)
+    var i = m.combine(self.lead, self.comp2, m.parse_status(b), self.abbr)
     if i == nil return end
     self.info = i
     store.set("info", i)
@@ -206,6 +196,16 @@ class _TeamApp
     self.ticks -= 1
   end
 
+  # Only show a team that's live, just finished, or playing today - not
+  # whatever game ESPN's "next scheduled" happens to point at (which, in
+  # the offseason, can be months out). Show the loading dots rather than
+  # hiding outright while data isn't in yet.
+  def should_show()
+    if self.info == nil return true end
+    var state = self.info["state"]
+    return state == "in" || state == "post" || self.info.find("is_today", true)
+  end
+
   def draw()
     clear()
     if self.info == nil
@@ -213,10 +213,8 @@ class _TeamApp
       return
     end
 
-    var state = self.info["state"]
     var parts = [[self.abbr + " ", 0x888888]]
-
-    if state == "pre"
+    if self.info["state"] == "pre"
       parts.push(["vs " + self.info["opp_abbr"] + "  ", 0xFFFFFF])
       parts.push([self.info["short_detail"], 0xAAAAAA])
       if self.info["network"] != nil
@@ -225,17 +223,14 @@ class _TeamApp
     else
       var mine = self.info["my_score"] != nil ? self.info["my_score"] : "-"
       var theirs = self.info["opp_score"] != nil ? self.info["opp_score"] : "-"
-      var c = m.color(self.info["my_score"], self.info["opp_score"])
-      parts.push([mine + "-" + theirs, c])
+      parts.push([mine + "-" + theirs, m.color(self.info["my_score"], self.info["opp_score"])])
       parts.push([" " + self.info["opp_abbr"] + "  ", 0x888888])
       parts.push([m.period_label(self.sport, self.info), 0xFFFFFF])
     end
-
     scroll_text(parts, 0xFFFFFF)
   end
 end
 
-# Factory: one instance per installed team app, sharing all logic above.
 m.make = def (abbr, sport)
   return _TeamApp(abbr, sport)
 end
